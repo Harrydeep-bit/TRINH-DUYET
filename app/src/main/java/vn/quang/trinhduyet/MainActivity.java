@@ -69,6 +69,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.webkit.ProxyConfig;
+import androidx.webkit.ProxyController;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
@@ -154,6 +156,8 @@ public class MainActivity extends Activity {
     ValueCallback<Uri[]> fileCb;
     boolean shieldPosted;
     String mediaJs = "";
+    int bypassMode = 0;      // 0: tắt, 1: DNS riêng, 2: proxy riêng
+    String customProxy = "";
     FrameLayout dlBtn;
     TextView dlBadge;
     int dlShown = 0;
@@ -189,8 +193,13 @@ public class MainActivity extends Activity {
         }).start();
 
         buildUi();
-        restoreTabs();
-        handleIntent(getIntent());
+        bypassMode = prefs.getInt("byp", 0);
+        customProxy = prefs.getString("proxy", "");
+        final Intent first = getIntent();
+        applyBypass(() -> {
+            restoreTabs();
+            handleIntent(first);
+        });
     }
 
     @Override
@@ -380,12 +389,13 @@ public class MainActivity extends Activity {
 
     void updateShield() {
         if (cur == null) return;
+        String g = bypassMode > 0 ? "🌐" : "";
         if (!cur.ab) {
-            shieldBtn.setText("🛡 tắt");
+            shieldBtn.setText(g + "🛡 tắt");
             shieldBtn.setTextColor(0xFF9E9E9E);
         } else {
             int n = cur.blocked.get();
-            shieldBtn.setText(n > 0 ? "🛡 " + n : "🛡");
+            shieldBtn.setText(g + (n > 0 ? "🛡 " + n : "🛡"));
             shieldBtn.setTextColor(GREEN);
         }
     }
@@ -572,6 +582,7 @@ public class MainActivity extends Activity {
     }
 
     void saveTabs() {
+        if (tabs.isEmpty()) return;
         JSONArray a = new JSONArray();
         for (Tab t : tabs) {
             String u = t.pendingUrl != null ? t.pendingUrl : t.wv.getUrl();
@@ -1142,6 +1153,7 @@ public class MainActivity extends Activity {
         m.add(0, 10, 0, globalOn ? "🛡 Tắt chặn quảng cáo (mọi trang)" : "🛡 Bật chặn quảng cáo");
         m.add(0, 11, 0, "Cập nhật danh sách chặn");
         m.add(0, 12, 0, "Xoá dữ liệu duyệt web");
+        m.add(0, 14, 0, "🌐 Vượt chặn web: " + (bypassMode == 1 ? "DNS riêng" : bypassMode == 2 ? "Proxy riêng" : "Tắt"));
         m.add(0, 13, 0, "Thoát");
         pm.setOnMenuItemClickListener(it -> {
             switch (it.getItemId()) {
@@ -1169,6 +1181,7 @@ public class MainActivity extends Activity {
                 case 11: updateList(); break;
                 case 12: clearData(); break;
                 case 13: saveTabs(); finishAndRemoveTask(); break;
+                case 14: showBypassDialog(); break;
             }
             return true;
         });
@@ -1597,6 +1610,123 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             toast("Không bắt đầu tải được: " + e.getMessage());
         }
+    }
+
+    // ------------------------------------------------------------------ vượt chặn web
+
+    void showBypassDialog() {
+        String[] opts = {
+                "Tắt",
+                "DNS riêng (Cloudflare) — vào được đa số trang bị nhà mạng chặn",
+                "Máy chủ proxy riêng — cho trang bị chặn theo IP"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("🌐 Vượt chặn web")
+                .setSingleChoiceItems(opts, bypassMode, (d, w) -> {
+                    d.dismiss();
+                    if (w == 2) askProxy();
+                    else setBypass(w, customProxy);
+                })
+                .setNegativeButton("Đóng", null)
+                .show();
+    }
+
+    void askProxy() {
+        final EditText e = new EditText(this);
+        e.setSingleLine(true);
+        e.setHint("vd: 123.45.67.89:8080 hoặc socks5://1.2.3.4:1080");
+        e.setText(customProxy);
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        LinearLayout box = new LinearLayout(this);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+        box.addView(e, new LinearLayout.LayoutParams(-1, -2));
+        new AlertDialog.Builder(this)
+                .setTitle("Máy chủ proxy")
+                .setMessage("Nhập địa chỉ proxy HTTP hoặc SOCKS5 (từ dịch vụ proxy/VPN anh dùng).")
+                .setView(box)
+                .setPositiveButton("Dùng", (d, w) -> {
+                    String p = e.getText().toString().trim();
+                    if (!p.matches("(?i)^((https?|socks5?)://)?[A-Za-z0-9.\\-]+:\\d{1,5}$")) {
+                        toast("Địa chỉ proxy không đúng dạng host:cổng");
+                        return;
+                    }
+                    setBypass(2, p);
+                })
+                .setNegativeButton("Huỷ", null)
+                .show();
+    }
+
+    void setBypass(int mode, String proxy) {
+        bypassMode = mode;
+        customProxy = proxy == null ? "" : proxy;
+        prefs.edit().putInt("byp", mode).putString("proxy", customProxy).apply();
+        applyBypass(() -> {
+            if (cur != null) cur.wv.reload();
+            updateShield();
+            toast(mode == 0 ? "Đã tắt vượt chặn" : mode == 1 ? "Đã bật vượt chặn (DNS riêng)" : "Đang đi qua proxy " + customProxy);
+        });
+    }
+
+    /** Áp dụng chế độ vượt chặn cho mọi tab, xong thì chạy done (trên luồng chính). */
+    void applyBypass(final Runnable done) {
+        final java.util.concurrent.Executor ex = main::post;
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+            if (bypassMode != 0) toast("Máy này chưa hỗ trợ vượt chặn, anh cập nhật Android System WebView rồi thử lại");
+            main.post(done);
+            return;
+        }
+        if (bypassMode == 0) {
+            Net.proxy = java.net.Proxy.NO_PROXY;
+            new Thread(LocalProxy::stop).start();
+            try {
+                ProxyController.getInstance().clearProxyOverride(ex, done);
+            } catch (Exception e) {
+                main.post(done);
+            }
+            return;
+        }
+        final int mode = bypassMode;
+        final String custom = customProxy;
+        new Thread(() -> {
+            String rule;
+            java.net.Proxy jp;
+            try {
+                if (mode == 1) {
+                    int port = LocalProxy.start();
+                    rule = "127.0.0.1:" + port;
+                    jp = new java.net.Proxy(java.net.Proxy.Type.HTTP, new java.net.InetSocketAddress("127.0.0.1", port));
+                } else {
+                    String p = custom.trim();
+                    boolean socks = p.toLowerCase(Locale.ROOT).startsWith("socks");
+                    String hp = p.replaceFirst("(?i)^[a-z0-9]+://", "");
+                    int c = hp.lastIndexOf(':');
+                    String host = hp.substring(0, c);
+                    int port = Integer.parseInt(hp.substring(c + 1));
+                    rule = (socks ? "socks5://" : "") + hp;
+                    jp = new java.net.Proxy(socks ? java.net.Proxy.Type.SOCKS : java.net.Proxy.Type.HTTP,
+                            java.net.InetSocketAddress.createUnresolved(host, port));
+                    LocalProxy.stop();
+                }
+            } catch (Exception e) {
+                main.post(() -> {
+                    toast("Không bật được vượt chặn: " + e.getMessage());
+                    done.run();
+                });
+                return;
+            }
+            final String r = rule;
+            final java.net.Proxy fp = jp;
+            main.post(() -> {
+                try {
+                    ProxyConfig pc = new ProxyConfig.Builder().addProxyRule(r).build();
+                    ProxyController.getInstance().setProxyOverride(pc, ex, done);
+                    Net.proxy = fp;
+                } catch (Exception e) {
+                    toast("Không bật được vượt chặn: " + e.getMessage());
+                    done.run();
+                }
+            });
+        }).start();
     }
 
     // ------------------------------------------------------------------ tiện ích

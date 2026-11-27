@@ -8,6 +8,7 @@ Trình duyệt web cho Android (Redmi Note 14), chặn quảng cáo.
 - Trang phim: tự bấm "Bỏ qua quảng cáo", tua qua video quảng cáo (JW Player…)
 - Ẩn khung quảng cáo, banner trôi (catfish)
 - Nút tải video nổi (kiểu IDM): tự hiện khi trang có video, tải MP4/WebM và video HLS (.m3u8, chọn chất lượng), lưu vào Download/TrinhDuyet
+- Vượt chặn web: DNS mã hoá riêng (Cloudflare) hoặc proxy HTTP/SOCKS5 riêng
 - Nhiều tab, dấu trang, xem bản máy tính, tải tệp, xem video toàn màn hình
 - Nút 🛡 hiện số quảng cáo đã chặn, có thể tắt chặn cho từng trang
 

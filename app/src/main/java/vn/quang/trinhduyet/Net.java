@@ -17,6 +17,9 @@ import java.util.Locale;
 final class Net {
     private Net() {}
 
+    /** Proxy dùng khi bật chế độ vượt chặn. */
+    static volatile java.net.Proxy proxy = java.net.Proxy.NO_PROXY;
+
     static String origin(String ref) {
         try {
             Uri u = Uri.parse(ref);
@@ -30,7 +33,7 @@ final class Net {
     static HttpURLConnection open(String url, String ref, String ua, String range) throws IOException {
         String cur = url;
         for (int hop = 0; hop < 6; hop++) {
-            HttpURLConnection c = (HttpURLConnection) new URL(cur).openConnection();
+            HttpURLConnection c = (HttpURLConnection) new URL(cur).openConnection(proxy);
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(20000);
             c.setReadTimeout(30000);
