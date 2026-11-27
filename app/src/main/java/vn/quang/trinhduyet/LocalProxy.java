@@ -149,6 +149,7 @@ final class LocalProxy {
                 remote = connect(host, port);
                 cout.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
                 cout.flush();
+                sendFirstTls(cin, remote.getOutputStream(), host);
                 pipe(client, remote);
                 return;
             }
@@ -169,13 +170,87 @@ final class LocalProxy {
             sb.append("Connection: close\r\n\r\n");
             remote = connect(u.getHost(), port);
             OutputStream rout = remote.getOutputStream();
-            rout.write(sb.toString().getBytes(StandardCharsets.ISO_8859_1));
+            byte[] req = sb.toString().getBytes(StandardCharsets.ISO_8859_1);
+            int hi = sb.indexOf("\r\nHost:");
+            int cut = hi < 0 ? 2 : hi + 9;
+            rout.write(req, 0, cut);           // tách dòng Host để bộ lọc không đọc được
+            rout.flush();
+            sleep(5);
+            rout.write(req, cut, req.length - cut);
             rout.flush();
             pipe(client, remote);
         } catch (Exception e) {
             try { client.close(); } catch (IOException ignored) {}
             try { if (remote != null) remote.close(); } catch (IOException ignored) {}
         }
+    }
+
+    private static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+    }
+
+    private static boolean readFully(InputStream in, byte[] b) throws IOException {
+        int off = 0;
+        while (off < b.length) {
+            int r = in.read(b, off, b.length - off);
+            if (r < 0) return false;
+            off += r;
+        }
+        return true;
+    }
+
+    /**
+     * Gói mở kết nối HTTPS (ClientHello) chứa tên trang ở dạng chữ thường.
+     * Nhà mạng đọc tên này để chặn. Ta cắt gói thành 2 bản ghi TLS và gửi
+     * thành nhiều đoạn TCP nhỏ, cắt ngay giữa tên trang, để bộ lọc không nhận ra.
+     */
+    private static void sendFirstTls(InputStream cin, OutputStream rout, String host) throws IOException {
+        byte[] hdr = new byte[5];
+        if (!readFully(cin, hdr)) throw new IOException("đóng");
+        if (hdr[0] != 0x16 || hdr[1] != 0x03) {
+            rout.write(hdr);
+            rout.flush();
+            return;
+        }
+        int len = ((hdr[3] & 0xff) << 8) | (hdr[4] & 0xff);
+        byte[] body = new byte[len];
+        if (!readFully(cin, body)) throw new IOException("đóng");
+        byte[] hb = host.toLowerCase(Locale.ROOT).getBytes(StandardCharsets.ISO_8859_1);
+        int at = indexOf(body, hb);
+        int cut = at > 0 ? at + Math.max(1, hb.length / 2) : Math.min(len - 1, 32);
+        if (cut <= 0 || cut >= len) {
+            rout.write(hdr);
+            rout.write(body);
+            rout.flush();
+            return;
+        }
+        byte[] r1 = new byte[5 + cut];
+        r1[0] = 0x16; r1[1] = hdr[1]; r1[2] = hdr[2];
+        r1[3] = (byte) (cut >> 8); r1[4] = (byte) cut;
+        System.arraycopy(body, 0, r1, 5, cut);
+        int rest = len - cut;
+        byte[] r2 = new byte[5 + rest];
+        r2[0] = 0x16; r2[1] = hdr[1]; r2[2] = hdr[2];
+        r2[3] = (byte) (rest >> 8); r2[4] = (byte) rest;
+        System.arraycopy(body, cut, r2, 5, rest);
+
+        rout.write(r1, 0, 3);
+        rout.flush();
+        sleep(5);
+        rout.write(r1, 3, r1.length - 3);
+        rout.flush();
+        sleep(5);
+        rout.write(r2);
+        rout.flush();
+    }
+
+    private static int indexOf(byte[] a, byte[] b) {
+        outer:
+        for (int i = 0; i <= a.length - b.length; i++) {
+            for (int j = 0; j < b.length; j++) if (a[i + j] != b[j]) continue outer;
+            return i;
+        }
+        return -1;
     }
 
     private static Socket connect(String host, int port) throws IOException {
