@@ -15,7 +15,17 @@ import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.Outline;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.view.MotionEvent;
+import android.view.ViewConfiguration;
+import android.view.ViewOutlineProvider;
+import android.view.animation.OvershootInterpolator;
+import android.widget.ImageView;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -74,7 +84,9 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -92,11 +104,26 @@ public class MainActivity extends Activity {
     final class Tab {
         WebView wv;
         volatile String pageHost = "";
+        volatile String pageUrl = "";
         volatile boolean ab = true;
         final AtomicInteger blocked = new AtomicInteger();
         boolean desktop;
         String title = "Tab mới";
         String pendingUrl; // tab khôi phục, chưa tải
+        final List<Media> media = new CopyOnWriteArrayList<>();
+    }
+
+    static final class Media {
+        String url, ref, title, kind;
+        volatile long size = -2; // -2: chưa dò, -1: không rõ
+    }
+
+    final class DlBridge {
+        final Tab t;
+        DlBridge(Tab t) { this.t = t; }
+        @JavascriptInterface public void found(String url, String ref, String title, String how) {
+            addMedia(t, url, ref, title, how);
+        }
     }
 
     final class Bridge {
@@ -126,6 +153,10 @@ public class MainActivity extends Activity {
     WebChromeClient.CustomViewCallback customCb;
     ValueCallback<Uri[]> fileCb;
     boolean shieldPosted;
+    String mediaJs = "";
+    FrameLayout dlBtn;
+    TextView dlBadge;
+    int dlShown = 0;
     final Runnable hidePopup = () -> { if (popupBar != null) popupBar.setVisibility(View.GONE); };
 
     // ------------------------------------------------------------------ vòng đời
@@ -138,6 +169,7 @@ public class MainActivity extends Activity {
         globalOn = prefs.getBoolean("on", true);
         totalBlocked.set(prefs.getLong("total", 0));
         injectJs = readAsset("inject.js");
+        mediaJs = readAsset("media.js");
         try {
             mobileUA = WebSettings.getDefaultUserAgent(this)
                     .replace("; wv", "")
@@ -302,8 +334,11 @@ public class MainActivity extends Activity {
         progress.setVisibility(View.INVISIBLE);
         col.addView(progress, new LinearLayout.LayoutParams(-1, dp(3)));
 
+        FrameLayout stage = new FrameLayout(this);
         content = new FrameLayout(this);
-        col.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+        stage.addView(content, new FrameLayout.LayoutParams(-1, -1));
+        buildDlButton(stage);
+        col.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
 
         popupBar = new LinearLayout(this);
         popupBar.setOrientation(LinearLayout.HORIZONTAL);
@@ -516,6 +551,7 @@ public class MainActivity extends Activity {
         showUrl();
         updateShield();
         updateTabsBtn();
+        updateDlBtn();
     }
 
     void closeTab(Tab t) {
@@ -650,11 +686,13 @@ public class MainActivity extends Activity {
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true);
         wv.addJavascriptInterface(new Bridge(t), "QuangAB");
+        wv.addJavascriptInterface(new DlBridge(t), "QuangDL");
 
         final boolean docStart = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT);
         if (docStart) {
             try {
                 WebViewCompat.addDocumentStartJavaScript(wv, injectJs, Collections.singleton("*"));
+                WebViewCompat.addDocumentStartJavaScript(wv, mediaJs, Collections.singleton("*"));
             } catch (Exception ignored) {}
         }
 
@@ -666,8 +704,13 @@ public class MainActivity extends Activity {
                 if (r.isForMainFrame()) {
                     String h = u.getHost();
                     t.pageHost = h == null ? "" : h;
+                    t.pageUrl = u.toString();
                     t.ab = abFor(t.pageHost);
                     t.blocked.set(0);
+                    if (!t.media.isEmpty()) {
+                        t.media.clear();
+                        main.post(() -> { if (t == cur) updateDlBtn(); });
+                    }
                     if (t == cur) postShield();
                     if (t.ab && (sc.equals("http") || sc.equals("https")) && AdBlocker.isAdHost(h)) {
                         countBlocked(t);
@@ -675,10 +718,15 @@ public class MainActivity extends Activity {
                     }
                     return null;
                 }
-                if (!t.ab) return null;
-                if ((sc.equals("http") || sc.equals("https")) && AdBlocker.isAd(u)) {
+                boolean web = sc.equals("http") || sc.equals("https");
+                if (t.ab && web && AdBlocker.isAd(u)) {
                     countBlocked(t);
                     return emptyResponse();
+                }
+                if (web) {
+                    Map<String, String> hd = r.getRequestHeaders();
+                    String ref = hd == null ? null : (hd.containsKey("Referer") ? hd.get("Referer") : hd.get("referer"));
+                    addMedia(t, u.toString(), ref, t.title, "");
                 }
                 return null;
             }
@@ -713,6 +761,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView v, String url, Bitmap fav) {
                 if (!docStart && t.ab) v.evaluateJavascript(injectJs, null);
+                if (!docStart) v.evaluateJavascript(mediaJs, null);
                 if (t == cur) {
                     progress.setVisibility(View.VISIBLE);
                     showUrl();
@@ -723,6 +772,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView v, String url) {
                 if (!docStart && t.ab) v.evaluateJavascript(injectJs, null);
+                if (!docStart) v.evaluateJavascript(mediaJs, null);
                 if (t == cur) {
                     progress.setVisibility(View.INVISIBLE);
                     showUrl();
@@ -1211,6 +1261,342 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton("Đóng", null)
                 .show();
+    }
+
+    // ------------------------------------------------------------------ tải video (nút nổi kiểu IDM)
+
+    static final Set<String> VIDEO_EXT = new HashSet<>(java.util.Arrays.asList(
+            "mp4", "m4v", "webm", "mov", "mkv", "flv", "3gp", "avi", "mp3", "m4a"));
+
+    static String extOf(Uri u) {
+        String p = u.getPath();
+        if (p == null) return "";
+        p = p.toLowerCase(Locale.ROOT);
+        int sl = p.lastIndexOf('/');
+        int dot = p.lastIndexOf('.');
+        return dot > sl ? p.substring(dot + 1) : "";
+    }
+
+    /** Gọi từ luồng nền hoặc JS: ghi nhận một video tìm thấy trong tab. */
+    void addMedia(Tab t, String url, String ref, String title, String how) {
+        if (url == null) return;
+        Uri u = Uri.parse(url);
+        String host = u.getHost();
+        if (host == null) return;
+        host = host.toLowerCase(Locale.ROOT);
+        // YouTube chia video thành nhiều mảnh có bảo vệ, không tải trực tiếp được
+        if (host.endsWith("googlevideo.com") || host.endsWith("youtube.com") || host.endsWith("ytimg.com")) return;
+        String ext = extOf(u);
+        String kind;
+        if (ext.equals("m3u8") || "m3u8".equals(how)) kind = "HLS";
+        else if (VIDEO_EXT.contains(ext)) kind = ext.toUpperCase(Locale.ROOT);
+        else if (("play".equals(how) || "source".equals(how)) && !ext.equals("ts") && !ext.equals("m4s")) kind = "VIDEO";
+        else return;
+        if (AdBlocker.isAdHost(host)) return;
+        for (Media m : t.media) if (m.url.equals(url)) return;
+        if (t.media.size() >= 40) return;
+        Media m = new Media();
+        m.url = url;
+        m.ref = (ref == null || ref.isEmpty()) ? t.pageUrl : ref;
+        m.title = (title == null || title.trim().isEmpty()) ? t.title : title;
+        m.kind = kind;
+        t.media.add(m);
+        main.post(() -> { if (t == cur) updateDlBtn(); });
+    }
+
+    void buildDlButton(FrameLayout stage) {
+        dlBtn = new FrameLayout(this);
+
+        GradientDrawable body = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0xFF81C784, 0xFF2E7D32, 0xFF1B5E20});
+        body.setShape(GradientDrawable.OVAL);
+        body.setStroke(dp(2), 0xFFC8E6C9);
+        GradientDrawable shine = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x99FFFFFF, 0x00FFFFFF});
+        shine.setShape(GradientDrawable.OVAL);
+        LayerDrawable ld = new LayerDrawable(new Drawable[]{body, shine});
+        ld.setLayerInset(1, dp(10), dp(4), dp(10), dp(28));
+
+        View ball = new View(this);
+        ball.setBackground(ld);
+        ball.setElevation(dp(10));
+        ball.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View v, Outline o) {
+                o.setOval(0, 0, v.getWidth(), v.getHeight());
+            }
+        });
+        dlBtn.addView(ball, new FrameLayout.LayoutParams(dp(58), dp(58), Gravity.CENTER));
+
+        ImageView ic = new ImageView(this);
+        ic.setImageResource(R.drawable.ic_dl);
+        ic.setElevation(dp(11));
+        dlBtn.addView(ic, new FrameLayout.LayoutParams(dp(30), dp(30), Gravity.CENTER));
+
+        dlBadge = new TextView(this);
+        dlBadge.setTextColor(Color.WHITE);
+        dlBadge.setTextSize(11);
+        dlBadge.setTypeface(Typeface.DEFAULT_BOLD);
+        dlBadge.setGravity(Gravity.CENTER);
+        GradientDrawable red = new GradientDrawable();
+        red.setShape(GradientDrawable.OVAL);
+        red.setColor(0xFFE53935);
+        red.setStroke(dp(1.5f), Color.WHITE);
+        dlBadge.setBackground(red);
+        dlBadge.setElevation(dp(12));
+        dlBtn.addView(dlBadge, new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.TOP | Gravity.END));
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(68), dp(68), Gravity.BOTTOM | Gravity.END);
+        lp.setMargins(0, 0, dp(12), dp(72));
+        stage.addView(dlBtn, lp);
+        dlBtn.setVisibility(View.GONE);
+
+        final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
+        final float[] st = new float[4];
+        final boolean[] drag = {false};
+        dlBtn.setOnTouchListener((v, e) -> {
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    st[0] = e.getRawX();
+                    st[1] = e.getRawY();
+                    st[2] = v.getX();
+                    st[3] = v.getY();
+                    drag[0] = false;
+                    v.animate().scaleX(0.86f).scaleY(0.86f).setDuration(90).start();
+                    return true;
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = e.getRawX() - st[0], dy = e.getRawY() - st[1];
+                    if (!drag[0] && Math.hypot(dx, dy) > slop) drag[0] = true;
+                    if (drag[0]) {
+                        View par = (View) v.getParent();
+                        v.setX(Math.max(0, Math.min(st[2] + dx, par.getWidth() - v.getWidth())));
+                        v.setY(Math.max(0, Math.min(st[3] + dy, par.getHeight() - v.getHeight())));
+                    }
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
+                    if (!drag[0]) v.performClick();
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
+                    return true;
+            }
+            return false;
+        });
+        dlBtn.setOnClickListener(v -> showMediaDialog());
+    }
+
+    void updateDlBtn() {
+        int n = cur == null ? 0 : cur.media.size();
+        if (n == 0) {
+            dlBtn.setVisibility(View.GONE);
+            dlShown = 0;
+            return;
+        }
+        dlBadge.setText(n > 9 ? "9+" : String.valueOf(n));
+        boolean pop = n > dlShown;
+        dlShown = n;
+        dlBtn.setVisibility(View.VISIBLE);
+        if (pop) {
+            dlBtn.setScaleX(0.5f);
+            dlBtn.setScaleY(0.5f);
+            dlBtn.animate().scaleX(1f).scaleY(1f).setDuration(350)
+                    .setInterpolator(new OvershootInterpolator(2.5f)).start();
+        }
+    }
+
+    static String sanitize(String s) {
+        if (s == null) return "";
+        s = s.replaceAll("[\\\\/:*?\"<>|\\r\\n\\t]+", " ").replaceAll("\\s+", " ").trim();
+        if (s.length() > 80) s = s.substring(0, 80).trim();
+        return s;
+    }
+
+    String mediaLabel(Media m) {
+        Uri u = Uri.parse(m.url);
+        String last = u.getLastPathSegment();
+        String ext = extOf(u);
+        boolean generic = last == null || ext.isEmpty() || last.length() < 6
+                || last.matches("(?i)(index|master|playlist|video|chunklist|prog_index|main|stream|output)[^.]*\\.m3u8");
+        if (!generic) return last;
+        return TextUtils.isEmpty(m.title) ? (u.getHost() == null ? "video" : u.getHost()) : m.title;
+    }
+
+    String fileBase(Media m) {
+        String t = sanitize(m.title);
+        if (t.isEmpty() || t.equalsIgnoreCase("Trang chủ")) {
+            Uri u = Uri.parse(m.url);
+            String last = u.getLastPathSegment();
+            t = sanitize(last == null ? "" : last.replaceAll("\\.[A-Za-z0-9]{2,4}$", ""));
+        }
+        if (t.isEmpty()) t = "video";
+        return t + "_" + new java.text.SimpleDateFormat("HHmmss", Locale.US).format(new java.util.Date());
+    }
+
+    static String human(long b) {
+        if (b < 0) return "";
+        if (b < 1024 * 1024) return String.format(Locale.US, "%.0f KB", b / 1024.0);
+        if (b < 1024L * 1024 * 1024) return String.format(Locale.US, "%.1f MB", b / 1048576.0);
+        return String.format(Locale.US, "%.2f GB", b / 1073741824.0);
+    }
+
+    void showMediaDialog() {
+        if (cur == null || cur.media.isEmpty()) return;
+        final Tab t = cur;
+        final String ua = t.wv.getSettings().getUserAgentString();
+        List<Media> list = new ArrayList<>(t.media);
+        Collections.reverse(list); // mới nhất lên đầu
+        ScrollView sv = new ScrollView(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(10), dp(6), dp(10), dp(6));
+        sv.addView(box);
+        final AlertDialog[] dlg = new AlertDialog[1];
+        for (final Media m : list) {
+            LinearLayout row = new LinearLayout(this);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(10), dp(10), dp(10), dp(10));
+            row.setBackground(round(0xFFF5F5F5, 12, 0));
+
+            TextView kind = new TextView(this);
+            kind.setText(m.kind);
+            kind.setTextColor(Color.WHITE);
+            kind.setTextSize(11);
+            kind.setTypeface(Typeface.DEFAULT_BOLD);
+            kind.setGravity(Gravity.CENTER);
+            kind.setBackground(round(m.kind.equals("HLS") ? 0xFF6A1B9A : m.kind.matches("MP3|M4A") ? 0xFFEF6C00 : 0xFF1565C0, 8, 0));
+            row.addView(kind, new LinearLayout.LayoutParams(dp(50), dp(30)));
+
+            LinearLayout mid = new LinearLayout(this);
+            mid.setOrientation(LinearLayout.VERTICAL);
+            mid.setPadding(dp(10), 0, dp(6), 0);
+            TextView name = new TextView(this);
+            name.setText(mediaLabel(m));
+            name.setTextColor(0xFF202124);
+            name.setTextSize(14);
+            name.setMaxLines(2);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            mid.addView(name);
+            final TextView detail = new TextView(this);
+            String host = Uri.parse(m.url).getHost();
+            final String base = (host == null ? "" : host) + (m.kind.equals("HLS") ? " · nhiều đoạn, chọn chất lượng khi tải" : "");
+            detail.setText(m.size >= 0 ? base + " · " + human(m.size) : base);
+            detail.setTextColor(0xFF5F6368);
+            detail.setTextSize(12);
+            detail.setMaxLines(1);
+            detail.setEllipsize(TextUtils.TruncateAt.END);
+            mid.addView(detail);
+            row.addView(mid, new LinearLayout.LayoutParams(0, -2, 1));
+
+            TextView go = new TextView(this);
+            go.setText("⬇");
+            go.setTextSize(20);
+            go.setTextColor(GREEN);
+            row.addView(go);
+
+            row.setOnClickListener(v -> { dlg[0].dismiss(); startMediaDownload(m, ua); });
+            row.setOnLongClickListener(v -> { copy(m.url); return true; });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+            lp.setMargins(0, dp(4), 0, dp(4));
+            box.addView(row, lp);
+
+            if (!m.kind.equals("HLS") && m.size == -2) {
+                m.size = -1;
+                new Thread(() -> {
+                    long sz = Net.size(m.url, m.ref, ua);
+                    m.size = sz;
+                    if (sz >= 0) main.post(() -> detail.setText(base + " · " + human(sz)));
+                }).start();
+            }
+        }
+        TextView note = new TextView(this);
+        note.setText("Chạm để tải · Giữ để chép liên kết\nTệp lưu ở thư mục Download/TrinhDuyet");
+        note.setTextColor(0xFF757575);
+        note.setTextSize(12);
+        note.setGravity(Gravity.CENTER);
+        note.setPadding(0, dp(8), 0, dp(4));
+        box.addView(note);
+        dlg[0] = new AlertDialog.Builder(this)
+                .setTitle("⬇ Tải video (" + list.size() + ")")
+                .setView(sv)
+                .setNegativeButton("Đóng", null)
+                .create();
+        dlg[0].show();
+    }
+
+    void askNotifPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 22);
+        }
+    }
+
+    void startMediaDownload(final Media m, final String ua) {
+        final String base = fileBase(m);
+        if (!m.kind.equals("HLS")) {
+            String ext = extOf(Uri.parse(m.url));
+            if (!VIDEO_EXT.contains(ext)) ext = "mp4";
+            final String name = base + "." + ext;
+            try {
+                DownloadManager.Request rq = new DownloadManager.Request(Uri.parse(m.url));
+                rq.addRequestHeader("User-Agent", ua);
+                if (m.ref != null && m.ref.startsWith("http")) {
+                    rq.addRequestHeader("Referer", m.ref);
+                    String o = Net.origin(m.ref);
+                    if (o != null) rq.addRequestHeader("Origin", o);
+                }
+                String ck = CookieManager.getInstance().getCookie(m.url);
+                if (ck != null) rq.addRequestHeader("Cookie", ck);
+                rq.setTitle(name);
+                rq.setMimeType(ext.equals("mp3") ? "audio/mpeg" : ext.equals("m4a") ? "audio/mp4" : "video/" + (ext.equals("mov") ? "quicktime" : ext));
+                rq.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                rq.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "TrinhDuyet/" + name);
+                ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(rq);
+                toast("Đang tải: " + name);
+            } catch (Exception e) {
+                toast("Lỗi tải về: " + e.getMessage());
+            }
+            return;
+        }
+        askNotifPermission();
+        toast("Đang đọc danh sách chất lượng…");
+        new Thread(() -> {
+            try {
+                String pl = Net.text(m.url, m.ref, ua);
+                if (!pl.contains("#EXTM3U")) throw new Exception("Không đọc được video");
+                final List<Net.Variant> vs = Net.variants(pl, m.url);
+                main.post(() -> {
+                    if (vs.size() <= 1) {
+                        startHls(vs.isEmpty() ? m.url : vs.get(0).url, base, m.ref, ua);
+                        return;
+                    }
+                    String[] labels = new String[vs.size()];
+                    for (int i = 0; i < vs.size(); i++) labels[i] = vs.get(i).label();
+                    new AlertDialog.Builder(this)
+                            .setTitle("Chọn chất lượng")
+                            .setItems(labels, (d, w) -> startHls(vs.get(w).url, base + "_" + labels[w].split(" ")[0], m.ref, ua))
+                            .setNegativeButton("Huỷ", null)
+                            .show();
+                });
+            } catch (Exception e) {
+                main.post(() -> toast("Không tải được: " + e.getMessage()));
+            }
+        }).start();
+    }
+
+    void startHls(String url, String name, String ref, String ua) {
+        Intent i = new Intent(this, DlService.class);
+        i.putExtra("url", url);
+        i.putExtra("name", sanitize(name));
+        i.putExtra("ref", ref);
+        i.putExtra("ua", ua);
+        try {
+            startForegroundService(i);
+            toast("Bắt đầu tải — xem tiến độ trên thanh thông báo");
+        } catch (Exception e) {
+            toast("Không bắt đầu tải được: " + e.getMessage());
+        }
     }
 
     // ------------------------------------------------------------------ tiện ích
